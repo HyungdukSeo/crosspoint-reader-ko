@@ -9,6 +9,10 @@
 
 #include <cassert>
 
+#ifdef CP_BLE_PROBE
+#include <BleKeyboardHost.h>
+#endif
+
 #include "HalGPIO.h"
 
 HalPowerManager powerManager;  // Singleton instance
@@ -54,6 +58,10 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   }
 
   auto wifiMode = WiFi.getMode();
+#ifdef CP_BLE_PROBE
+  // The BLE controller must not run at the reader's 10 MHz idle clock.
+  if (BleHid.isRunning()) enabled = false;
+#endif
   if (wifiMode != WIFI_MODE_NULL) {
     // Wifi is active, force disabling power saving
     enabled = false;

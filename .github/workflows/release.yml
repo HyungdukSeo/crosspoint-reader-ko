@@ -36,38 +36,42 @@ jobs:
       run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip esptool
 
     - name: Set version from tag
+      env:
+        RELEASE_VERSION: ${{ github.ref_name }}
       run: |
-        sed -i "s/^crosspoint_version = .*/crosspoint_version = ${{ github.ref_name }}/" platformio.ini
+        python3 scripts/set_release_version.py
 
     - name: Build CrossPoint
-      run: pio run -e gh_release
+      run: |
+        pio run -e ble_probe
+        python3 scripts/check_ota_size.py .pio/build/ble_probe/firmware.bin
 
     - name: Merge firmware binaries
       run: |
-        esptool.py --chip esp32c3 merge_bin \
-          -o .pio/build/gh_release/CrossPoint-${{ github.ref_name }}.bin \
-          --flash_mode dio \
-          --flash_freq 80m \
-          --flash_size 16MB \
-          0x0 .pio/build/gh_release/bootloader.bin \
-          0x8000 .pio/build/gh_release/partitions.bin \
-          0x10000 .pio/build/gh_release/firmware.bin
+        python3 -m esptool --chip esp32c3 merge-bin \
+          -o ".pio/build/ble_probe/CrossPoint-${GITHUB_REF_NAME}.bin" \
+          --flash-mode dio \
+          --flash-freq 80m \
+          --flash-size 16MB \
+          0x0 .pio/build/ble_probe/bootloader.bin \
+          0x8000 .pio/build/ble_probe/partitions.bin \
+          0x10000 .pio/build/ble_probe/firmware.bin
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: CrossPoint-${{ github.ref_name }}
         path: |
-          .pio/build/gh_release/bootloader.bin
-          .pio/build/gh_release/firmware.bin
-          .pio/build/gh_release/firmware.elf
-          .pio/build/gh_release/firmware.map
-          .pio/build/gh_release/partitions.bin
+          .pio/build/ble_probe/bootloader.bin
+          .pio/build/ble_probe/firmware.bin
+          .pio/build/ble_probe/firmware.elf
+          .pio/build/ble_probe/firmware.map
+          .pio/build/ble_probe/partitions.bin
 
     - name: Resolve release notes
       id: notes
       run: |
-        NOTES="docs/release-notes/${{ github.ref_name }}.md"
+        NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
         if [[ -f "$NOTES" ]]; then
           echo "Using release notes from $NOTES"
           echo "path=$NOTES" >> "$GITHUB_OUTPUT"
@@ -82,23 +86,12 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          .pio/build/gh_release/CrossPoint-${{ github.ref_name }}.bin
-          .pio/build/gh_release/firmware.bin
-          .pio/build/gh_release/bootloader.bin
-          .pio/build/gh_release/partitions.bin
+          .pio/build/ble_probe/CrossPoint-${{ github.ref_name }}.bin
+          .pio/build/ble_probe/firmware.bin
+          .pio/build/ble_probe/bootloader.bin
+          .pio/build/ble_probe/partitions.bin
         body_path: ${{ steps.notes.outputs.path }}
         generate_release_notes: ${{ steps.notes.outputs.generate }}
         draft: false
         prerelease: false
-
-    - name: Trigger docs deployment
-      continue-on-error: true
-      run: gh workflow run deploy.yml -R crosspoint-reader-ko/crosspoint-reader-docs
-      env:
-        GH_TOKEN: ${{ secrets.CROSSPOINT_ACTION_TOKEN }}
-
-    - name: Trigger crosspoint-cloud firmware sync
-      continue-on-error: true
-      run: gh workflow run sync-version.yml -R crosspoint-reader-ko/crosspoint-cloud
-      env:
-        GH_TOKEN: ${{ secrets.CROSSPOINT_ACTION_TOKEN }}
+        make_latest: true

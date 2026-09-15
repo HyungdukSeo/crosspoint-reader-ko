@@ -66,6 +66,11 @@ for upstream parity; individual languages toggle with
 
 ## Measured
 
+For the 2026-09-15 BLE keyboard experiment, see [BLE probe measurements](ble-probe.md#measurements):
+the release baseline is 5,887,440 bytes and the BLE probe is 6,118,448 bytes,
+leaving 435,152 bytes below the stock OTA limit. These are newer measurements
+than the historical release table below; runtime BLE heap usage is still unmeasured.
+
 | Build | `firmware.bin` | vs 6.25 MB |
 |-------|---------------|------------|
 | 1.3.0-ko.1 | 6,461,088 | 92,512 under |

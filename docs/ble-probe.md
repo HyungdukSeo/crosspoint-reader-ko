@@ -1,9 +1,36 @@
 # BLE keyboard footprint probe
 
-`ble_probe` builds the release firmware with the SDK BLE HID host and a serial
-diagnostic interface. It measures the cost of discovery, pairing, reconnection,
-and receiving key events before adding settings UI or an editor. It does not
-insert received keys into the app's text fields.
+`ble_probe` builds the release firmware with the SDK BLE HID host, an on-device
+pairing/input-test screen, and an optional serial diagnostic interface. It does
+not insert received keys into other app text fields or provide a note editor.
+
+## On-device test (15.05 and later)
+
+USB serial is **not required** for this procedure.
+
+1. Open **Settings → System → Bluetooth keyboard** (설정 → 시스템 → 블루투스 키보드).
+2. Put the keyboard in pairing mode and choose **Search for keyboards**.
+   For Clicks Power Keyboard, hold Power and press a number key (1–9), following
+   the [manufacturer's pairing instructions](https://learn.clicks.tech/knowledge-base/kb-power-keyboard-getting-started-pairing-additional-devices).
+3. The screen shows received discovery/result events and elapsed time. Search
+   lasts 15 seconds; Confirm shows results early and Back cancels.
+4. Select the device with Previous/Next and press Confirm. Anonymous devices are
+   listed by address. The firmware verifies the HID service after connecting.
+5. If a six-digit code appears, type it on the keyboard and press Enter.
+6. After connecting, type English letters. The screen shows sample text and the
+   last key received; Backspace edits the sample. Confirm clears the sample.
+7. Back disconnects. Leaving this screen turns Bluetooth off. Saved pairings can
+   be selected from **Paired keyboards** on the next visit.
+
+If the keyboard is absent, return to the Bluetooth menu and compare **Search
+without scan requests** (passive scan) and **Search on 1M PHY only**. These change
+how discovery runs; success with another mode is evidence for further diagnosis,
+not proof of a particular radio defect. Initial advertisements and final scan
+results both feed the device list, before a name or HID advertisement is required.
+The signal counter counts callbacks, including repeats, not unique devices.
+
+This screen is an English input test, not a Hangul IME or general editor.
+Actual Clicks/X3 discovery and pairing still require hardware verification.
 
 ## Build
 
@@ -35,11 +62,14 @@ The SDK's passkey-display callback requires NimBLE 2.4.0 or newer despite its
 older documented minimum. The pinned 2.5.1 also fixes a scan timer crash during
 reinitialization; see the [NimBLE release notes](https://github.com/h2zero/NimBLE-Arduino/releases).
 
-## Hardware procedure
+## Optional USB serial procedure
 
 Requires a BLE HID keyboard and a device with working USB serial. A USB-locked
-X3 cannot use this interface; an on-device pairing screen would be needed.
+X3 can use the on-device screen above instead.
 Building does not install the image onto a device.
+
+Close the on-device Bluetooth screen before issuing serial commands: the screen
+owns key/passkey consumption while it is open.
 
 After installing the probe firmware and booting with USB attached, open a
 115200-baud serial terminal with newline-terminated input. Start from the home
@@ -82,6 +112,10 @@ sleep; wake with the device power button and send ON again. This probe does not
 implement keyboard wake from deep sleep or assess battery life.
 
 ## Measurements
+
+The table below records the earlier serial-only probe. The on-device screen in
+15.05 adds code and translations; use the actual 15.05 release asset size for
+its budget, not this historical table.
 
 Measured on 2026-09-15, application base `84a3919`, SDK `a485dc4`, with the
 probe changes in the working tree. Both use release logging and the same fonts.

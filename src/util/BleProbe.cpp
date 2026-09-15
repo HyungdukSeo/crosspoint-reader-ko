@@ -1,5 +1,7 @@
 #include "BleProbe.h"
 
+#include "BleScanDiagnostics.h"
+
 #ifdef CP_BLE_PROBE
 #include <BleKeyboardHost.h>
 #include <HalPowerManager.h>
@@ -13,21 +15,43 @@ static_assert(CONFIG_BT_NIMBLE_ROLE_CENTRAL && CONFIG_BT_NIMBLE_ROLE_OBSERVER &&
 
 namespace BleProbe {
 namespace {
+bool uiOwnsInput = false;
+bool uiInput = false;
 void memory(const char* stage) {
   LOG_INF("BLE", "%s: free=%u min=%u maxBlock=%u running=%d connected=%d", stage, ESP.getFreeHeap(),
           ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), BleHid.isRunning(), BleHid.isConnected());
 }
 }  // namespace
 
+void setUiOwnsInput(bool owns) {
+  uiOwnsInput = owns;
+  uiInput = false;
+}
+void reportUiInput() { uiInput = true; }
+
 void stop() {
   if (BleHid.isRunning()) {
     powerManager.setPowerSaving(false);
     BleHid.end();
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+    BleScanDiagnostics::reset();
+#endif
     memory("off");
   }
 }
 
 void command(const String& command) {
+  if (uiOwnsInput) {
+    LOG_INF("BLE", "Close the Bluetooth keyboard screen before using serial commands");
+    return;
+  }
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+  if (BleScanDiagnostics::command(command)) return;
+  if (BleScanDiagnostics::active() && command != "BLE:OFF" && command != "BLE:STATUS") {
+    LOG_INF("SCAN", "Run CMD:BLE:OFF before leaving raw scan mode");
+    return;
+  }
+#endif
   if (command == "BLE:ON") {
     powerManager.setPowerSaving(false);
     memory("before begin");
@@ -42,7 +66,8 @@ void command(const String& command) {
     LOG_INF("BLE", "Run CMD:BLE:ON first");
   } else if (command == "BLE:SCAN") {
     BleHid.startScan(5000);
-    memory("scan started");
+    LOG_INF("BLE", "scan requested: scanning=%d", BleHid.isScanning());
+    memory("after scan request");
   } else if (command == "BLE:LIST") {
     // Avoid reading SDK scan records while its callback is updating them.
     BleHid.stopScan();
@@ -61,6 +86,16 @@ void command(const String& command) {
 }
 
 bool poll() {
+  if (uiOwnsInput) {
+    const bool activity = uiInput;
+    uiInput = false;
+    return activity;
+  }
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+  if (BleScanDiagnostics::active()) {
+    return BleScanDiagnostics::poll();
+  }
+#endif
   BleHid.poll();
   static bool connected = false;
   if (connected != BleHid.isConnected()) {

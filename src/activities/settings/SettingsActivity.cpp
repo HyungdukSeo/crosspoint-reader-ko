@@ -9,6 +9,9 @@
 #include <cstring>
 
 #include "ButtonRemapActivity.h"
+#ifdef CP_BLE_PROBE
+#include "BluetoothKeyboardActivity.h"
+#endif
 #include "ClearCacheActivity.h"
 #include "CrossPointSettings.h"
 #include "FontSelectionActivity.h"
@@ -74,6 +77,9 @@ void SettingsActivity::rebuildSettingsLists() {
                             SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
   }
   systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
+#ifdef CP_BLE_PROBE
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_BLUETOOTH_KEYBOARD, SettingAction::BluetoothKeyboard));
+#endif
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
@@ -380,6 +386,11 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::Network:
         startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false), resultHandler);
+        break;
+      case SettingAction::BluetoothKeyboard:
+#ifdef CP_BLE_PROBE
+        startActivityForResult(std::make_unique<BluetoothKeyboardActivity>(renderer, mappedInput), resultHandler);
+#endif
         break;
       case SettingAction::ClearCache:
         startActivityForResult(std::make_unique<ClearCacheActivity>(renderer, mappedInput), resultHandler);

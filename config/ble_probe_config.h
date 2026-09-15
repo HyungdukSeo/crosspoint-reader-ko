@@ -5,6 +5,10 @@
 // they do not rebuild or shrink the precompiled radio controller.
 #include <sdkconfig.h>
 
+// HID/name metadata can arrive after the first advertisement. Let the pairing
+// screen show anonymous candidates and validate HID service at connection time.
+#define FREEINK_BLE_HID_SHOW_UNNAMED_DEVICES 1
+
 // NimBLE's compatibility header otherwise re-enables these from legacy names.
 #undef CONFIG_NIMBLE_ROLE_PERIPHERAL
 #undef CONFIG_NIMBLE_ROLE_BROADCASTER

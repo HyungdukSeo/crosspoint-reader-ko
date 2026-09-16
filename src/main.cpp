@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#ifdef CP_BLE_PROBE
+#include <BleKeyboardHost.h>
+#endif
 #include <BoardConfig.h>
 #include <Epub.h>
 #include <FontCacheManager.h>
@@ -588,6 +591,15 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 
+#ifdef CP_BLE_PROBE
+  static bool readerOwnsBleInput = false;
+  const bool readerActivity = activityManager.isCurrentReaderActivity();
+  if (readerActivity != readerOwnsBleInput) {
+    BleProbe::setUiOwnsInput(readerActivity);
+    readerOwnsBleInput = readerActivity;
+  }
+#endif
+
   if (Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
             ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
@@ -617,6 +629,13 @@ void loop() {
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
 #ifdef CP_BLE_PROBE
+  if (readerActivity && BleHid.isRunning()) {
+    BleHid.poll();
+    freeink::KeyEvent key;
+    while (BleHid.popKey(key)) {
+      if (activityManager.handleBleKey(key)) BleProbe::reportUiInput();
+    }
+  }
   if (BleProbe::poll()) lastActivityTime = millis();
 #endif
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() || halTiltSensor.hadActivity() ||

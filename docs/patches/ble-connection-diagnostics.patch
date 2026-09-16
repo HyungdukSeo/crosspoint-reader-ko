@@ -1,0 +1,465 @@
+diff --git a/libs/network/BleKeyboardHost/include/BleKeyboardHost.h b/libs/network/BleKeyboardHost/include/BleKeyboardHost.h
+index 00cfbbf..0feafe3 100644
+--- a/libs/network/BleKeyboardHost/include/BleKeyboardHost.h
++++ b/libs/network/BleKeyboardHost/include/BleKeyboardHost.h
+@@ -106,9 +106,12 @@ class BleKeyboardHost {
+   // --- Discovery -------------------------------------------------------------
+   void startScan(uint32_t ms = 5000);
+   void stopScan();
++  // Use SDK-owned callbacks; UI activities must not leave a pointer to themselves.
++  void restoreScanCallbacks();
+   bool isScanning() const { return scanning_; }
+   uint8_t deviceCount() const { return deviceCount_; }
+   const DiscoveredDevice& device(uint8_t i) const;
++  uint8_t copyDiscoveredDevices(DiscoveredDevice* out, uint8_t capacity) const;
+   // Free scan bookkeeping after connecting, to reclaim RAM while writing.
+   void releaseScanResults();
+ 
+@@ -116,17 +119,24 @@ class BleKeyboardHost {
+   // Begin an async connect to a scanned/bonded address. isConnected() flips once
+   // the link is encrypted and the HID input report is subscribed.
+   bool connect(const char* addr);
++#ifdef CP_BLE_DIRECT_CONNECT
++  bool setDiagnosticOptions(int addressType, bool securityFirst);
++  int diagnosticAddressType() const;
++  bool diagnosticSecurityFirst() const;
++#endif
+   void disconnect();
+   bool isConnected() const { return connected_; }
+-  bool isConnecting() const { return connecting_; }
++  bool isConnecting() const;
+   const char* connectedName() const { return connName_; }
+   bool takeConnectFailure(char* out, size_t outLen);
+   bool takePairingPasskey(uint32_t& out);
+ 
+   // --- Pairings (persisted) --------------------------------------------------
+   uint8_t pairedCount() const { return bondCount_; }
++  // Read saved devices without powering up the radio.
++  void loadSavedDevices();
+   const PairedHidDevice& paired(uint8_t i) const;
+-  void forget(const char* addr);
++  bool forget(const char* addr);
+ 
+   // --- Translated input ------------------------------------------------------
+   // Pop the next key event. Returns false when the queue is empty.
+diff --git a/libs/network/BleKeyboardHost/src/BleKeyboardHost.cpp b/libs/network/BleKeyboardHost/src/BleKeyboardHost.cpp
+index 4e66ec4..0caa1c8 100644
+--- a/libs/network/BleKeyboardHost/src/BleKeyboardHost.cpp
++++ b/libs/network/BleKeyboardHost/src/BleKeyboardHost.cpp
+@@ -46,7 +46,14 @@ constexpr uint16_t kDescReportReference = 0x2908;
+ // yields one event and the next press re-triggers.
+ constexpr uint32_t kReleaseTimeoutMs = 150;
+ constexpr uint32_t kReconnectBackoffMs = 4000;
++#ifdef CP_BLE_DIRECT_CONNECT
++constexpr uint32_t kConnectTimeoutMs = 20000;
++int g_diagnosticAddressType = 1;
++bool g_diagnosticSecurityFirst = true;
++bool g_diagnosticInitFailed = false;
++#else
+ constexpr uint32_t kConnectTimeoutMs = 8000;
++#endif
+ constexpr uint32_t kTeardownConnectWaitMs = kConnectTimeoutMs + 500;
+ constexpr size_t kScanDebugPayloadMax = 31;
+ 
+@@ -212,10 +219,16 @@ void doConnect(const char* addrStr, uint8_t type) {
+     return;
+   }
+   NimBLEDevice::getScan()->stop();
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] connect begin addr=%s type=%u free=%u\n", addrStr, type, ESP.getFreeHeap());
++#endif
+   NimBLEAddress addr(std::string(addrStr), type);
+   if (!g_client->connect(addr)) {
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+     Serial.printf("[BleHid] connect failed: %s type=%u err=%d\n", addrStr, type, g_client->getLastError());
++#endif
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++    Serial.printf("[BLE stage] connect failed type=%u error=%d\n", type, g_client->getLastError());
+ #endif
+     if (!g_targetTryAltType) {
+       self().onConnectFailed(g_client->getLastError() == BLE_HS_ETIMEOUT ? "Connect timeout" : "Connection failed");
+@@ -224,6 +237,9 @@ void doConnect(const char* addrStr, uint8_t type) {
+     type = type == 0 ? 1 : 0;
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+     Serial.printf("[BleHid] retry connect: %s type=%u\n", addrStr, type);
++#endif
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++    Serial.printf("[BLE stage] alternate address type=%u begin\n", type);
+ #endif
+     addr = NimBLEAddress(std::string(addrStr), type);
+     if (!g_client->connect(addr)) {
+@@ -234,6 +250,45 @@ void doConnect(const char* addrStr, uint8_t type) {
+       return;
+     }
+   }
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] link connected; HID discovery begin\n");
++#endif
++#ifdef CP_BLE_DIRECT_CONNECT
++  const auto failDiagnostic = [](const char* reason) {
++    Serial.printf("[BLE diag] failure=%s connected=%d lastError=%d free=%u\n", reason,
++                  g_client->isConnected(), g_client->getLastError(), ESP.getFreeHeap());
++    self().onConnectFailed(reason);  // Record before local disconnect changes the error.
++    g_client->disconnect();
++  };
++  const auto secureDiagnostic = [&]() {
++    Serial.printf("[BLE diag] security begin connected=%d\n", g_client->isConnected());
++    const bool ok = g_client->secureConnection();
++    Serial.printf("[BLE diag] security end ok=%d connected=%d lastError=%d\n", ok,
++                  g_client->isConnected(), g_client->getLastError());
++    return ok;
++  };
++  if (g_diagnosticSecurityFirst && !secureDiagnostic()) {
++    failDiagnostic("Security setup failed");
++    return;
++  }
++  Serial.printf("[BLE diag] service enumeration begin connected=%d\n", g_client->isConnected());
++  const auto& services = g_client->getServices(true);
++  bool foundHid = false;
++  Serial.printf("[BLE diag] services=%u connected=%d lastError=%d (may be stale)\n",
++                unsigned(services.size()), g_client->isConnected(), g_client->getLastError());
++  for (const auto* service : services) {
++    Serial.printf("[BLE diag] service UUID=%s\n", service->getUUID().toString().c_str());
++    if (service->getUUID() == NimBLEUUID(kHidService)) foundHid = true;
++  }
++  if (!g_client->isConnected() || !foundHid) {
++    failDiagnostic(g_client->isConnected() ? "HID service unavailable" : "Disconnected during service discovery");
++    return;
++  }
++  if (!g_diagnosticSecurityFirst && !secureDiagnostic()) {
++    failDiagnostic("Security setup failed");
++    return;
++  }
++#else
+   if (!hasHidService(g_client)) {
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+     Serial.printf("[BleHid] no HID service: %s\n", addrStr);
+@@ -242,6 +297,9 @@ void doConnect(const char* addrStr, uint8_t type) {
+     self().onConnectFailed("Not a HID device");
+     return;
+   }
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] HID found; security begin\n");
++#endif
+   if (!g_client->secureConnection()) {
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+     Serial.printf("[BleHid] security failed: %s err=%d\n", addrStr, g_client->getLastError());
+@@ -250,6 +308,10 @@ void doConnect(const char* addrStr, uint8_t type) {
+     self().onConnectFailed("Pairing failed");
+     return;
+   }
++#endif  // CP_BLE_DIRECT_CONNECT
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] security complete; input subscription begin\n");
++#endif
+   if (!setupHid(g_client)) {
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+     Serial.printf("[BleHid] HID setup failed: %s\n", addrStr);
+@@ -258,6 +320,9 @@ void doConnect(const char* addrStr, uint8_t type) {
+     self().onConnectFailed("No HID input report");
+     return;
+   }
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] input subscription complete\n");
++#endif
+   self().onLinkUp(addrStr, nullptr, type);  // name resolved from scan/bond lists
+ }
+ 
+@@ -270,6 +335,9 @@ void connTaskFn(void*) {
+ }
+ 
+ class ScanCB : public NimBLEScanCallbacks {
++  // The settings UI receives primary advertisements as well as scan responses.
++  // Keep the callback owned by the SDK so it outlives every settings activity.
++  void onDiscovered(const NimBLEAdvertisedDevice* dev) override { onResult(dev); }
+   void onResult(const NimBLEAdvertisedDevice* dev) override {
+     if (!dev) return;
+     // Store named/HID advertisers by default; optionally keep anonymous
+@@ -305,7 +373,12 @@ class ScanCB : public NimBLEScanCallbacks {
+ };
+ 
+ class ClientCB : public NimBLEClientCallbacks {
+-  void onDisconnect(NimBLEClient*, int) override { self().onLinkDown(); }
++  void onDisconnect(NimBLEClient*, int reason) override {
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++    Serial.printf("[BLE diag] disconnected reason=%d at=%lu\n", reason, millis());
++#endif
++    self().onLinkDown();
++  }
+   void onPassKeyEntry(NimBLEConnInfo& connInfo) override { NimBLEDevice::injectPassKey(connInfo, 123456); }
+   uint32_t onPassKeyDisplay(NimBLEConnInfo&) override {
+     const uint32_t passkey = NimBLEDevice::getSecurityPasskey();
+@@ -326,11 +399,74 @@ class ClientCB : public NimBLEClientCallbacks {
+ ScanCB g_scanCb;
+ ClientCB g_clientCb;
+ 
++// Deleting a saved device while the radio is OFF must not initialize NimBLE.
++// Record only explicit user deletions; apply them once the stack is available.
++// Never clear a peer's security keys as part of an ordinary connection attempt.
++struct ForgottenPeer {
++  char addr[18];
++  uint8_t type;
++};
++
++uint8_t readForgottenPeers(Preferences& p, ForgottenPeer* peers) {
++  if (!p.isKey("forget")) return 0;
++  const size_t bytes = p.getBytesLength("forget");
++  if (bytes == 0 || bytes > sizeof(ForgottenPeer) * BleKeyboardHost::kMaxBonds || bytes % sizeof(ForgottenPeer)) {
++    return 0;
++  }
++  if (p.getBytes("forget", peers, bytes) != bytes) return 0;
++  const uint8_t count = bytes / sizeof(ForgottenPeer);
++  for (uint8_t i = 0; i < count; ++i) peers[i].addr[17] = '\0';
++  return count;
++}
++
++bool queueForgottenPeer(const PairedHidDevice& peer) {
++  Preferences p;
++  if (!p.begin("freeink-hid", false)) return false;
++  ForgottenPeer peers[BleKeyboardHost::kMaxBonds]{};
++  uint8_t count = readForgottenPeers(p, peers);
++  for (uint8_t i = 0; i < count; ++i) {
++    if (strcmp(peers[i].addr, peer.addr) == 0 && peers[i].type == peer.addrType) return true;
++  }
++  if (count == BleKeyboardHost::kMaxBonds) return false;
++  strncpy(peers[count].addr, peer.addr, sizeof(peers[count].addr) - 1);
++  peers[count++].type = peer.addrType;
++  const size_t bytes = count * sizeof(ForgottenPeer);
++  return p.putBytes("forget", peers, bytes) == bytes;
++}
++
++void applyForgottenPeers() {
++  Preferences p;
++  if (!p.begin("freeink-hid", false)) return;
++  ForgottenPeer peers[BleKeyboardHost::kMaxBonds]{};
++  const uint8_t count = readForgottenPeers(p, peers);
++  uint8_t remaining = 0;
++  for (uint8_t i = 0; i < count; ++i) {
++    const NimBLEAddress addr(std::string(peers[i].addr), peers[i].type);
++    // Preserve transient failures, but an already absent bond is complete too.
++    // Checking the result also handles identity mapping for a private address.
++    const int result = ble_gap_unpair(addr.getBase());
++    if (result != 0 && result != BLE_HS_ENOENT) peers[remaining++] = peers[i];
++  }
++  if (remaining) p.putBytes("forget", peers, remaining * sizeof(ForgottenPeer));
++  else if (count) p.remove("forget");
++}
++
+ }  // namespace
+ 
+ // --- Lifecycle ---------------------------------------------------------------
+ bool BleKeyboardHost::begin(const char* hostName) {
+   if (begun_) return true;
++#ifdef CP_BLE_DIRECT_CONNECT
++  if (g_diagnosticInitFailed) {
++    Serial.println("[BLE init] Previous init failed; reboot required before retry");
++    return false;
++  }
++  // Conservative diagnostic guard based on measured C3 init allocations.
++  if (ESP.getFreeHeap() < 80000) {
++    Serial.printf("[BLE init] Not attempted: low heap free=%u maxBlock=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
++    return false;
++  }
++#endif
+ 
+ #if FREEINK_BLE_HID_SCAN_DEBUG
+   Serial.printf("[BleHid] begin: host='%s' bonds=%u\n", hostName ? hostName : "FreeInk", bondCount_);
+@@ -352,10 +488,17 @@ bool BleKeyboardHost::begin(const char* hostName) {
+   Serial.printf("[BleHid] begin: loaded bonds=%u\n", bondCount_);
+ #endif
+   if (!NimBLEDevice::init(hostName ? hostName : "FreeInk")) {
++#ifdef CP_BLE_DIRECT_CONNECT
++    // init may leave controller allocations while isInitialized() is false.
++    // Do not repeatedly allocate into that partial state; reboot recovers it.
++    g_diagnosticInitFailed = true;
++#endif
+     Serial.println("[BleHid] begin: NimBLEDevice::init() failed");
+     return false;
+   }
+ 
++  applyForgottenPeers();
++
+   // HID page-turner reports are a few bytes; request the minimum ATT MTU so the
+   // host doesn't reserve large per-connection GATT buffers. On RAM-constrained
+   // targets (ESP32-C3, ~16 KB max contiguous block once the stack is up) every KB
+@@ -366,8 +509,12 @@ bool BleKeyboardHost::begin(const char* hostName) {
+   // have no input/display capability; mandatory MITM makes those devices reject
+   // pairing. Firmware that specifically needs host-display keyboard pairing can
+   // opt in with FREEINK_BLE_HID_REQUIRE_MITM=1.
+-  NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/FREEINK_BLE_HID_REQUIRE_MITM, /*sc=*/false);
+-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
++  // Use LE Secure Connections. Modern HID devices (including Nape Pro) may
++  // reject legacy pairing even when MITM is not required. X3 has no input or
++  // display path for a PIN, so advertise NoInputNoOutput and use Just Works
++  // unless the build explicitly requires MITM.
++  NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/FREEINK_BLE_HID_REQUIRE_MITM, /*sc=*/true);
++  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+   NimBLEDevice::setSecurityPasskey(123456);
+   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
+   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
+@@ -513,6 +660,7 @@ void BleKeyboardHost::poll() {
+     g_lastGenericCode = 0;
+   }
+ 
++#ifndef CP_BLE_DIRECT_CONNECT
+   // Auto-reconnect to a bonded HID peripheral.
+   if (!connected_ && !g_connecting && !scanning_ && bondCount_ > 0) {
+     const uint32_t now = millis();
+@@ -523,6 +671,7 @@ void BleKeyboardHost::poll() {
+       g_reconnectIdx++;
+     }
+   }
++#endif
+ }
+ 
+ // --- Discovery ---------------------------------------------------------------
+@@ -569,6 +718,19 @@ void BleKeyboardHost::stopScan() {
+   scanning_ = false;
+ }
+ 
++void BleKeyboardHost::restoreScanCallbacks() {
++  if (begun_) NimBLEDevice::getScan()->setScanCallbacks(&g_scanCb, true);
++}
++
++uint8_t BleKeyboardHost::copyDiscoveredDevices(DiscoveredDevice* out, uint8_t capacity) const {
++  if (!out || !capacity) return 0;
++  portENTER_CRITICAL(&g_mux);
++  const uint8_t count = deviceCount_ < capacity ? deviceCount_ : capacity;
++  memcpy(out, devices_, count * sizeof(DiscoveredDevice));
++  portEXIT_CRITICAL(&g_mux);
++  return count;
++}
++
+ const DiscoveredDevice& BleKeyboardHost::device(uint8_t i) const {
+   static const DiscoveredDevice kEmpty{};
+   return i < deviceCount_ ? devices_[i] : kEmpty;
+@@ -582,6 +744,17 @@ void BleKeyboardHost::releaseScanResults() {
+ }
+ 
+ // --- Connection --------------------------------------------------------------
++#ifdef CP_BLE_DIRECT_CONNECT
++bool BleKeyboardHost::setDiagnosticOptions(int addressType, bool securityFirst) {
++  if (addressType < -1 || addressType > 1 || g_connecting || connected_) return false;
++  g_diagnosticAddressType = addressType;
++  g_diagnosticSecurityFirst = securityFirst;
++  return true;
++}
++int BleKeyboardHost::diagnosticAddressType() const { return g_diagnosticAddressType; }
++bool BleKeyboardHost::diagnosticSecurityFirst() const { return g_diagnosticSecurityFirst; }
++#endif
++
+ bool BleKeyboardHost::connect(const char* addr) {
+   if (!begun_ || !addr || g_connecting) return false;
+ 
+@@ -602,6 +775,14 @@ bool BleKeyboardHost::connect(const char* addr) {
+     }
+   }
+ 
++#ifdef CP_BLE_DIRECT_CONNECT
++  if (g_diagnosticAddressType >= 0) {
++    type = static_cast<uint8_t>(g_diagnosticAddressType);
++    knownType = true;
++  }
++  Serial.printf("[BLE diag] options type=%d securityFirst=%d timeout=%lu\n", g_diagnosticAddressType,
++                g_diagnosticSecurityFirst, static_cast<unsigned long>(kConnectTimeoutMs));
++#endif
+   strncpy(g_targetAddr, addr, sizeof(g_targetAddr) - 1);
+   g_targetAddr[sizeof(g_targetAddr) - 1] = '\0';
+   g_targetType = type;
+@@ -619,22 +800,37 @@ void BleKeyboardHost::disconnect() {
+   if (g_client && g_client->isConnected()) g_client->disconnect();
+ }
+ 
++bool BleKeyboardHost::isConnecting() const {
++  // Failure callbacks arrive before the worker returns. Do not allow UI retry
++  // or the next saved peer to race the tail of that connection attempt.
++  // A disconnect request is asynchronous; the handle is cleared only after
++  // NimBLE delivers the disconnect event and makes the client reusable.
++  return g_connecting || connecting_ ||
++         (!connected_ && g_client && g_client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE);
++}
++
+ // --- Pairings ----------------------------------------------------------------
++void BleKeyboardHost::loadSavedDevices() {
++  if (!begun_ && !g_connecting) loadBonds();
++}
++
+ const PairedHidDevice& BleKeyboardHost::paired(uint8_t i) const {
+   static const PairedHidDevice kEmpty{};
+   return i < bondCount_ ? bonds_[i] : kEmpty;
+ }
+ 
+-void BleKeyboardHost::forget(const char* addr) {
+-  if (!addr) return;
++bool BleKeyboardHost::forget(const char* addr) {
++  if (!addr || g_connecting) return false;
+   for (uint8_t i = 0; i < bondCount_; ++i) {
+     if (strncmp(bonds_[i].addr, addr, sizeof(bonds_[i].addr)) != 0) continue;
+-    NimBLEDevice::deleteBond(NimBLEAddress(std::string(bonds_[i].addr), bonds_[i].addrType));
++    if (!queueForgottenPeer(bonds_[i])) return false;
+     for (uint8_t j = i + 1; j < bondCount_; ++j) bonds_[j - 1] = bonds_[j];
+     bondCount_--;
+     persistBonds();
+-    return;
++    if (begun_) applyForgottenPeers();
++    return true;
+   }
++  return false;
+ }
+ 
+ // --- Translated input --------------------------------------------------------
+@@ -962,6 +1158,9 @@ void BleKeyboardHost::onLinkDown() {
+ }
+ 
+ void BleKeyboardHost::onConnectFailed(const char* reason) {
++#ifdef CP_BLE_SCAN_DIAGNOSTICS
++  Serial.printf("[BLE stage] failure=%s error=%d\n", reason ? reason : "unknown", g_client ? g_client->getLastError() : -1);
++#endif
+   connected_ = false;
+   connecting_ = false;
+   portENTER_CRITICAL(&g_mux);
+@@ -1007,14 +1206,19 @@ bool BleKeyboardHost::takePairingPasskey(uint32_t& out) {
+ 
+ // --- NVS persistence ---------------------------------------------------------
+ void BleKeyboardHost::loadBonds() {
++  bondCount_ = 0;
++  memset(bonds_, 0, sizeof(bonds_));
+   Preferences p;
+   if (!p.begin("freeink-hid", true)) return;
+   bondCount_ = p.getUChar("n", 0);
+   if (bondCount_ > kMaxBonds) bondCount_ = kMaxBonds;
+-  if (bondCount_ > 0) p.getBytes("b", bonds_, bondCount_ * sizeof(PairedHidDevice));
++  if (bondCount_ > 0 && p.getBytes("b", bonds_, bondCount_ * sizeof(PairedHidDevice)) !=
++                            bondCount_ * sizeof(PairedHidDevice)) bondCount_ = 0;
+   p.end();
+   bool cleaned = false;
+   for (uint8_t i = 0; i < bondCount_; ++i) {
++    bonds_[i].addr[sizeof(bonds_[i].addr) - 1] = '\0';
++    bonds_[i].name[sizeof(bonds_[i].name) - 1] = '\0';
+     if (bonds_[i].name[0] && strcmp(bonds_[i].name, bonds_[i].addr) == 0) {
+       bonds_[i].name[0] = '\0';
+       cleaned = true;
+@@ -1042,6 +1246,8 @@ void BleKeyboardHost::end() {}
+ void BleKeyboardHost::poll() {}
+ void BleKeyboardHost::startScan(uint32_t) {}
+ void BleKeyboardHost::stopScan() {}
++void BleKeyboardHost::restoreScanCallbacks() {}
++uint8_t BleKeyboardHost::copyDiscoveredDevices(DiscoveredDevice*, uint8_t) const { return 0; }
+ const DiscoveredDevice& BleKeyboardHost::device(uint8_t) const {
+   static const DiscoveredDevice kEmpty{};
+   return kEmpty;
+@@ -1049,11 +1255,13 @@ const DiscoveredDevice& BleKeyboardHost::device(uint8_t) const {
+ void BleKeyboardHost::releaseScanResults() {}
+ bool BleKeyboardHost::connect(const char*) { return false; }
+ void BleKeyboardHost::disconnect() {}
++bool BleKeyboardHost::isConnecting() const { return false; }
++void BleKeyboardHost::loadSavedDevices() {}
+ const PairedHidDevice& BleKeyboardHost::paired(uint8_t) const {
+   static const PairedHidDevice kEmpty{};
+   return kEmpty;
+ }
+-void BleKeyboardHost::forget(const char*) {}
++bool BleKeyboardHost::forget(const char*) { return false; }
+ bool BleKeyboardHost::popKey(KeyEvent&) { return false; }
+ void BleKeyboardHost::onScanResultIngest(const char*, const char*, int, uint8_t, bool, bool) {}
+ void BleKeyboardHost::onReportIngest(const uint8_t*, size_t) {}

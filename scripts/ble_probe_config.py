@@ -5,8 +5,16 @@ SCons' source scanner does not track this -include header automatically.
 
 import hashlib
 from pathlib import Path
+import subprocess
+import sys
 
 Import("env")
+
+if env["PIOENV"] == "ble_direct_debug":
+    subprocess.run(
+        [sys.executable, str(Path(env["PROJECT_DIR"]) / "scripts" / "verify_ble_direct9_baseline.py")],
+        check=True,
+    )
 
 config = Path(env["PROJECT_DIR"]) / "config" / "ble_probe_config.h"
 digest = hashlib.sha256(config.read_bytes()).hexdigest()[:8]

@@ -1,5 +1,8 @@
 #include "EpubReaderActivity.h"
 
+#ifdef CP_BLE_PROBE
+#include <BleKeyboardHost.h>
+#endif
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
 #include <FontCacheManager.h>
@@ -777,6 +780,36 @@ void EpubReaderActivity::loop() {
     pageTurn(true);
   }
 }
+
+#ifdef CP_BLE_PROBE
+bool EpubReaderActivity::handleBleKey(const freeink::KeyEvent& key) {
+  if (key.special != freeink::SpecialKey::PageUp && key.special != freeink::SpecialKey::PageDown) return false;
+
+  const bool next = key.special == freeink::SpecialKey::PageDown;
+  readingTimer.notifyInput();
+
+  if (currentSpineIndex > 0 && epub && currentSpineIndex >= epub->getSpineItemsCount()) {
+    if (endOfBookOptions.menuActive()) return true;
+    if (next) {
+      onGoHome();
+    } else {
+      currentSpineIndex = std::max(epub->getSpineItemsCount() - 1, 0);
+      nextPageNumber = 0;
+      pendingPageJump = std::numeric_limits<uint16_t>::max();
+      requestUpdate();
+    }
+    return true;
+  }
+
+  if (!section) {
+    requestUpdate();
+    return true;
+  }
+
+  pageTurn(next);
+  return true;
+}
+#endif
 
 // Translate an absolute percent into a spine index plus a normalized position
 // within that spine so we can jump after the section is loaded.

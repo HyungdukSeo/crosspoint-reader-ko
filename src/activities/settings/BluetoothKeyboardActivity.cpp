@@ -1,12 +1,14 @@
 #include "BluetoothKeyboardActivity.h"
 
 #ifdef CP_BLE_PROBE
+#include <FontCacheManager.h>
 #include <HalPowerManager.h>
 #include <I18n.h>
+#include <Logging.h>
+#include <NimBLEDevice.h>
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -14,24 +16,46 @@
 
 void BluetoothKeyboardActivity::onEnter() {
   Activity::onEnter();
-  BleProbe::stop();
+  stopUiScan();
   BleProbe::setUiOwnsInput(true);
   state = State::Menu;
+  savedConnectIndex = -1;
+  // Opening settings only observes the service. It must neither initialize an
+  // OFF radio nor restart an existing connection.
+  if (BleHid.isConnecting()) {
+    state = State::Connecting;
+    peer = BleHid.connectedName();
+    connectStarted = millis();
+  }
   requestUpdate();
 }
 
 void BluetoothKeyboardActivity::onExit() {
-  // The callback object belongs to this activity. Stop BLE before it is freed.
-  BleProbe::stop();
+  // Bluetooth is a user-controlled service. Leaving this screen must not turn
+  // it off or discard the active HID connection; only stop an in-progress scan.
+  stopUiScan();
   BleProbe::setUiOwnsInput(false);
   Activity::onExit();
+}
+
+void BluetoothKeyboardActivity::stopUiScan() {
+  if (!BleHid.isRunning()) return;
+  BleHid.stopScan();
+  // All scan events go to the SDK-owned callback; none retain this activity.
+  BleHid.restoreScanCallbacks();
 }
 
 bool BluetoothKeyboardActivity::preventAutoSleep() { return state == State::Scanning || state == State::Connecting; }
 
 bool BluetoothKeyboardActivity::startRadio() {
-  BleProbe::stop();
+  if (BleHid.isRunning()) return true;
   powerManager.setPowerSaving(false);
+#ifdef CP_BLE_DIRECT_CONNECT
+  const auto beforeCache = ESP.getFreeHeap();
+  if (auto* cache = renderer.getFontCacheManager()) cache->clearCache();
+  LOG_INF("BLE", "before init: cache release free=%u -> %u maxBlock=%u", beforeCache, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
+#endif
   if (!BleHid.begin("CrossPoint")) {
     status = tr(STR_BLE_START_FAILED);
     state = State::Error;
@@ -41,38 +65,65 @@ bool BluetoothKeyboardActivity::startRadio() {
   return true;
 }
 
-void BluetoothKeyboardActivity::ingest(const NimBLEAdvertisedDevice* device) {
-  if (!device) return;
-  ++signals;
-  const auto address = device->getAddress();
-  const auto addr = address.toString();
-  const auto name = device->getName();
-  const bool hid = device->isAdvertisingService(NimBLEUUID(uint16_t{0x1812})) ||
-                   (device->haveAppearance() && device->getAppearance() == 0x03c1);
-  // Capture initial advertisements too: onResult alone may wait for a scan
-  // response. Both paths bypass any name/HID advertising requirement.
-  portENTER_CRITICAL(&scanMux);
-  BleHid.onScanResultIngest(addr.c_str(), name.c_str(), device->getRSSI(), address.getType(), hid,
-                            device->isConnectable());
-  portEXIT_CRITICAL(&scanMux);
+bool BluetoothKeyboardActivity::startConnection(const std::string& address, const std::string& name) {
+  retryAddr = address;
+  retryPeer = name;
+  peer = name.empty() ? address : name;
+  passkey.clear();
+  text.clear();
+  lastKey.clear();
+  notification.clear();
+  if (!startRadio()) return false;
+  stopUiScan();
+#ifdef CP_BLE_DIRECT_CONNECT
+  // Keep every UI entry point on the same direct9 settings, including retries
+  // and saved-device auto-connect. Connection negotiation belongs to the SDK.
+  BleHid.setDiagnosticOptions(-1, true);
+#endif
+  if (!BleHid.connect(retryAddr.c_str())) {
+    status = tr(STR_CONNECTION_FAILED);
+    state = State::Error;
+    requestUpdate();
+    return false;
+  }
+  state = State::Connecting;
+  connectStarted = millis();
+  requestUpdate();
+  return true;
 }
 
 void BluetoothKeyboardActivity::startScan(int mode) {
+  retryAddr.clear();
+  retryPeer.clear();
+  savedConnectIndex = -1;
+  notification.clear();
+  // This host has one client. Explicitly adding another device first releases
+  // the existing link; saved registrations survive the radio restart.
+  if (BleHid.isConnected()) {
+    stopUiScan();
+    BleProbe::stop();
+  }
   if (!startRadio()) return;
+  stopUiScan();
+  BleHid.releaseScanResults();
   scanMode = mode;
-  savedList = false;
-  signals = 0;
   deviceCount = selected = 0;
   status.clear();
   auto* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(this, true);
   scan->setActiveScan(mode != 1);
   scan->setDuplicateFilter(0);
   scan->setFilterPolicy(0);
   scan->setLimitedOnly(false);
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+  scan->setInterval(30);
+  scan->setWindow(30);
+#else
   scan->setInterval(160);
   scan->setWindow(160);
+#endif
+#if CONFIG_BT_NIMBLE_EXT_ADV
   scan->setPhy(mode == 2 ? NimBLEScan::SCAN_1M : NimBLEScan::SCAN_ALL);
+#endif
   scan->setMaxResults(0);
   scanStarted = millis();
   if (!scan->start(15000, false, true)) {
@@ -85,23 +136,27 @@ void BluetoothKeyboardActivity::startScan(int mode) {
 }
 
 void BluetoothKeyboardActivity::collectResults() {
-  BleHid.stopScan();
-  portENTER_CRITICAL(&scanMux);
-  deviceCount = BleHid.deviceCount();
-  for (int i = 0; i < deviceCount; ++i) devices[i] = BleHid.device(i);
-  portEXIT_CRITICAL(&scanMux);
+  stopUiScan();
+  deviceCount = BleHid.copyDiscoveredDevices(devices.data(), static_cast<uint8_t>(devices.size()));
   std::sort(devices.begin(), devices.begin() + deviceCount, [](const auto& a, const auto& b) {
     if (a.connectable != b.connectable) return a.connectable;
     return a.rssi > b.rssi;
   });
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+  LOG_INF("SCAN", "mode=%d retained=%d", scanMode, deviceCount);
+  for (int i = 0; i < deviceCount; ++i) {
+    LOG_INF("SCAN", "device=%s name=%s hid=%d rssi=%d", devices[i].addr, devices[i].name, devices[i].hid,
+            devices[i].rssi);
+  }
+#endif
   state = State::Devices;
   selected = 0;
   requestUpdate();
 }
 
 void BluetoothKeyboardActivity::showSaved() {
-  if (!startRadio()) return;
-  savedList = true;
+  // Loading the saved list does not require a running Bluetooth controller.
+  BleHid.loadSavedDevices();
   deviceCount = BleHid.pairedCount();
   for (int i = 0; i < deviceCount; ++i) {
     const auto& bond = BleHid.paired(i);
@@ -112,39 +167,80 @@ void BluetoothKeyboardActivity::showSaved() {
     devices[i].addrType = bond.addrType;
   }
   selected = 0;
-  state = State::Devices;
+  state = State::SavedDevices;
+  requestUpdate();
+}
+
+void BluetoothKeyboardActivity::connectSaved(int index) {
+  if (index < 0 || index >= BleHid.pairedCount()) {
+    savedConnectIndex = -1;
+    state = State::Menu;
+    requestUpdate();
+    return;
+  }
+  for (; index < BleHid.pairedCount(); ++index) {
+    savedConnectIndex = index;
+    const auto& bond = BleHid.paired(index);
+    if (startConnection(bond.addr, bond.name[0] ? bond.name : bond.addr)) return;
+    if (!BleHid.isRunning()) break;
+  }
+  savedConnectIndex = -1;
+  notification = status;
+  notificationUntil = millis() + 3500;
   requestUpdate();
 }
 
 int BluetoothKeyboardActivity::itemCount() const {
-  return state == State::Menu ? 5 : state == State::Devices ? deviceCount + 1 : 0;
+  if (state == State::Menu) return 3;
+  if (state == State::Devices) return deviceCount + 1;
+  if (state == State::SavedDevices) return deviceCount + 1;
+  return 0;
 }
 
 void BluetoothKeyboardActivity::activate() {
   if (state == State::Menu) {
-    if (selected < 3)
-      startScan(selected);
-    else if (selected == 3)
+    if (selected == 0) {
+      notification.clear();
+      retryAddr.clear();
+      retryPeer.clear();
+      if (BleHid.isRunning()) {
+        stopUiScan();
+        BleProbe::stop();
+        savedConnectIndex = -1;
+      } else {
+        if (startRadio() && BleHid.pairedCount() > 0) connectSaved(0);
+      }
+      requestUpdate();
+    } else if (selected == 1) {
+      startScan(0);
+    } else {
       showSaved();
-    else
-      finish();
+    }
   } else if (state == State::Devices) {
     if (selected == deviceCount) {
       startScan(scanMode);
     } else if (!devices[selected].connectable) {
+      retryAddr.clear();
+      retryPeer.clear();
       status = tr(STR_BLE_NOT_CONNECTABLE);
       state = State::Error;
     } else {
-      peer = devices[selected].name[0] ? devices[selected].name : devices[selected].addr;
-      passkey.clear();
-      text.clear();
-      lastKey.clear();
-      if (BleHid.connect(devices[selected].addr)) {
-        state = State::Connecting;
-        connectStarted = millis();
-      } else {
-        status = tr(STR_CONNECTION_FAILED);
-        state = State::Error;
+      savedConnectIndex = -1;
+      startConnection(devices[selected].addr, devices[selected].name);
+    }
+    requestUpdate();
+  } else if (state == State::SavedDevices) {
+    if (selected == deviceCount) {
+      state = State::Menu;
+      selected = 2;
+    } else {
+      const int deletedIndex = selected;
+      const bool deleted = BleHid.forget(devices[selected].addr);
+      showSaved();
+      selected = std::min(deletedIndex, deviceCount);
+      if (!deleted) {
+        notification = std::string(tr(STR_DELETE)) + ": " + tr(STR_FAILED_LOWER);
+        notificationUntil = millis() + 3500;
       }
     }
     requestUpdate();
@@ -153,13 +249,25 @@ void BluetoothKeyboardActivity::activate() {
 
 void BluetoothKeyboardActivity::loop() {
   RenderLock lock(*this);
-  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+  if (!notification.empty() && static_cast<int32_t>(millis() - notificationUntil) >= 0) {
+    notification.clear();
+    requestUpdate();
+  }
+  // The async worker reports its result to this screen. Keep it visible until
+  // that result arrives instead of abandoning a pending pairing in the menu.
+  if (state != State::Connecting && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     if (state == State::Menu) {
       lock.unlock();
       finish();
       return;
     }
-    BleProbe::stop();
+    if (state == State::SavedDevices) {
+      state = State::Menu;
+      selected = 2;
+      requestUpdate();
+      return;
+    }
+    if (state == State::Scanning) stopUiScan();
     state = State::Menu;
     selected = 0;
     requestUpdate();
@@ -170,6 +278,7 @@ void BluetoothKeyboardActivity::loop() {
       collectResults();
     } else if (millis() - lastPaint >= 1000) {
       lastPaint = millis();
+      deviceCount = BleHid.copyDiscoveredDevices(devices.data(), static_cast<uint8_t>(devices.size()));
       requestUpdate();
     }
     return;
@@ -186,21 +295,47 @@ void BluetoothKeyboardActivity::loop() {
       requestUpdate();
     }
     char failure[48];
-    if (BleHid.takeConnectFailure(failure, sizeof(failure))) {
-      status = std::string(tr(STR_CONNECTION_FAILED)) + ": " + failure;
-      state = State::Error;
+    if (!BleHid.isConnecting() && BleHid.takeConnectFailure(failure, sizeof(failure))) {
+      if (savedConnectIndex >= 0 && savedConnectIndex + 1 < BleHid.pairedCount()) {
+        connectSaved(savedConnectIndex + 1);
+      } else {
+        savedConnectIndex = -1;
+        status = std::string(tr(STR_CONNECTION_FAILED)) + ": " + failure;
+        notification = status;
+        notificationUntil = millis() + 3500;
+        state = State::Error;
+      }
       requestUpdate();
-    } else if (state == State::Connecting && BleHid.isConnected()) {
+    } else if (state == State::Connecting && !BleHid.isConnecting() && BleHid.isConnected()) {
       BleHid.releaseScanResults();
+      savedConnectIndex = -1;
       state = State::Connected;
+      notification = peer + "  " + tr(STR_CONNECTED);
+      notificationUntil = millis() + 3500;
       requestUpdate();
-    } else if (state == State::Connecting && millis() - connectStarted > 45000) {
+    } else if (state == State::Connecting && millis() - connectStarted >
+#ifdef CP_BLE_DIRECT_CONNECT
+                                                 90000
+#else
+                                                 45000
+#endif
+    ) {
+      stopUiScan();
       BleProbe::stop();
-      status = tr(STR_BLE_CONNECT_TIMEOUT);
-      state = State::Error;
+      if (savedConnectIndex >= 0 && savedConnectIndex + 1 < BleHid.pairedCount()) {
+        connectSaved(savedConnectIndex + 1);
+      } else {
+        savedConnectIndex = -1;
+        status = tr(STR_BLE_CONNECT_TIMEOUT);
+        notification = status;
+        notificationUntil = millis() + 3500;
+        state = State::Error;
+      }
       requestUpdate();
     } else if (state == State::Connected && !BleHid.isConnected()) {
       status = tr(STR_BLE_DISCONNECTED);
+      notification = status;
+      notificationUntil = millis() + 3500;
       state = State::Error;
       requestUpdate();
     }
@@ -254,8 +389,6 @@ void BluetoothKeyboardActivity::loop() {
   const int count = itemCount();
   if (count > 0) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-      // popActivity() can wait for rendering; don't hold its mutex on exit.
-      if (state == State::Menu && selected == 4) lock.unlock();
       activate();
       return;
     }
@@ -268,13 +401,30 @@ void BluetoothKeyboardActivity::loop() {
       requestUpdate();
     });
   } else if (state == State::Error && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    state = State::Menu;
-    selected = 0;
+    // Retry the last connection directly. Searching again is unnecessary and
+    // can miss a rotating/private address while the HID is still advertising.
+    if (!retryAddr.empty()) {
+      savedConnectIndex = -1;
+      startConnection(retryAddr, retryPeer);
+    } else {
+      state = State::Menu;
+      selected = 0;
+    }
     requestUpdate();
   }
 }
 
 void BluetoothKeyboardActivity::render(RenderLock&&) {
+#ifdef CP_BLE_DIRECT_CONNECT
+  // Rendering owns the render lock. Glyph buffers are no longer needed once
+  // pixels have been copied, and keeping them can starve BLE initialization.
+  struct ReleaseFontCache {
+    FontCacheManager* cache;
+    ~ReleaseFontCache() {
+      if (cache) cache->clearCache();
+    }
+  } releaseFontCache{renderer.getFontCacheManager()};
+#endif
   renderer.clearScreen();
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int width = renderer.getScreenWidth();
@@ -287,33 +437,45 @@ void BluetoothKeyboardActivity::render(RenderLock&&) {
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + row * line, clipped.c_str());
   };
   const char* confirm = tr(STR_SELECT);
-  if (state == State::Menu || state == State::Devices) {
-    static constexpr StrId labels[] = {StrId::STR_BLE_SCAN_DEFAULT, StrId::STR_BLE_SCAN_PASSIVE, StrId::STR_BLE_SCAN_1M,
-                                       StrId::STR_BLE_SAVED, StrId::STR_BLE_EXIT};
+  if (state == State::Menu || state == State::Devices || state == State::SavedDevices) {
     GUI.drawList(
         renderer, Rect{0, top, width, height}, itemCount(), selected,
         [&](int index) -> std::string {
-          if (state == State::Menu) return I18N.get(labels[index]);
+          if (state == State::Menu) {
+            if (index == 0) return BleHid.isRunning() ? "Bluetooth: ON" : "Bluetooth: OFF";
+            if (index == 1) return tr(STR_BLE_SCAN_DEFAULT);
+            return tr(STR_BLE_SAVED);
+          }
+          if (state == State::SavedDevices) {
+            if (index == deviceCount) return tr(STR_BLE_EXIT);
+            const std::string label = devices[index].name[0] ? devices[index].name : devices[index].addr;
+            return std::string(tr(STR_DELETE)) + ": " + label;
+          }
           if (index == deviceCount) return tr(STR_BLE_SCAN_AGAIN);
           return devices[index].name[0] ? devices[index].name : devices[index].addr;
         },
         [&](int index) -> std::string {
           if (state == State::Menu) return "";
+          if (state == State::SavedDevices) {
+            if (index == deviceCount) return deviceCount ? "" : tr(STR_NO_ENTRIES);
+            return devices[index].addr;
+          }
           if (index == deviceCount) return deviceCount ? "" : tr(STR_BLE_NO_DEVICES);
-          if (savedList) return devices[index].addr;
           char info[64];
           snprintf(info, sizeof(info), "%s  %d dBm%s", devices[index].addr, devices[index].rssi,
                    devices[index].connectable ? "" : " [non-connectable]");
           return info;
         });
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height,
-                      I18N.get(state == State::Menu ? StrId::STR_BLE_EXIT_HINT : StrId::STR_BLE_UNNAMED_HINT));
+    const char* hint = state == State::Devices ? tr(STR_BLE_UNNAMED_HINT) : tr(STR_BLE_EXIT_HINT);
+    const auto clippedHint = renderer.truncatedText(UI_10_FONT_ID, hint, width - metrics.contentSidePadding * 2);
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height, clippedHint.c_str());
+    if (state == State::SavedDevices && selected < deviceCount) confirm = tr(STR_DELETE);
   } else if (state == State::Scanning) {
     draw(0, tr(STR_SCANNING));
     draw(2, tr(STR_BLE_PAIRING_HINT));
     draw(3, tr(STR_BLE_UNNAMED_HINT));
     char progress[80];
-    snprintf(progress, sizeof(progress), tr(STR_BLE_SCAN_PROGRESS), signals.load(),
+    snprintf(progress, sizeof(progress), tr(STR_BLE_SCAN_PROGRESS), static_cast<unsigned>(deviceCount),
              static_cast<unsigned>((millis() - scanStarted) / 1000));
     draw(5, progress);
     confirm = tr(STR_BLE_SHOW_RESULTS);
@@ -336,11 +498,17 @@ void BluetoothKeyboardActivity::render(RenderLock&&) {
   } else {
     const auto lines = renderer.wrappedText(UI_10_FONT_ID, status.c_str(), width - metrics.contentSidePadding * 2, 4);
     for (size_t i = 0; i < lines.size(); ++i) draw(i, lines[i]);
-    confirm = tr(STR_RETRY);
+    confirm = retryAddr.empty() ? tr(STR_BLE_EXIT) : tr(STR_RETRY);
   }
-  const auto labels =
-      mappedInput.mapLabels(I18N.get(state == State::Connected ? StrId::STR_BLE_DISCONNECT : StrId::STR_BACK), confirm,
-                            itemCount() ? tr(STR_DIR_UP) : "", itemCount() ? tr(STR_DIR_DOWN) : "");
+  if (!notification.empty() && static_cast<int32_t>(notificationUntil - millis()) > 0) {
+    const auto popupStyle = metrics.popupTextBold ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR;
+    const auto clipped = renderer.truncatedText(
+        UI_12_FONT_ID, notification.c_str(),
+        std::max(0, width - 2 * (metrics.popupMarginX + metrics.popupFrameThickness)), popupStyle);
+    GUI.drawPopup(renderer, clipped.c_str());
+  }
+  const auto labels = mappedInput.mapLabels(state == State::Connecting ? "" : tr(STR_BACK), confirm,
+                                            itemCount() ? tr(STR_DIR_UP) : "", itemCount() ? tr(STR_DIR_DOWN) : "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }

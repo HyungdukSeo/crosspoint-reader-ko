@@ -1,6 +1,9 @@
 #include "TxtReaderActivity.h"
 
 #include <BidiUtils.h>
+#ifdef CP_BLE_PROBE
+#include <BleKeyboardHost.h>
+#endif
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -330,6 +333,16 @@ void TxtReaderActivity::pageTurn(const bool isForwardTurn) {
   lastPageTurnTime = millis();
   requestUpdate();
 }
+
+#ifdef CP_BLE_PROBE
+bool TxtReaderActivity::handleBleKey(const freeink::KeyEvent& key) {
+  if (key.special != freeink::SpecialKey::PageUp && key.special != freeink::SpecialKey::PageDown) return false;
+
+  readingTimer.notifyInput();
+  pageTurn(key.special == freeink::SpecialKey::PageDown);
+  return true;
+}
+#endif
 
 void TxtReaderActivity::jumpPages(const int deltaPages) {
   if (deltaPages == 0 || fileSize == 0) {

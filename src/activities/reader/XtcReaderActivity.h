@@ -51,6 +51,9 @@ class XtcReaderActivity final : public Activity {
   void loop() override;
   void render(RenderLock&&) override;
   bool isReaderActivity() const override { return true; }
+#ifdef CP_BLE_PROBE
+  bool handleBleKey(const freeink::KeyEvent& key) override;
+#endif
   bool handleForcedRefresh() override {
     {
       RenderLock lock(*this);

@@ -13,6 +13,10 @@
 #include "RenderLock.h"
 #include "util/ScreenshotInfo.h"
 
+namespace freeink {
+struct KeyEvent;
+}
+
 class Activity {
   friend class ActivityManager;
 
@@ -48,6 +52,7 @@ class Activity {
   virtual bool handleForcedRefresh() { return false; }
   virtual bool isHomeActivity() const { return false; }
   virtual bool handleHomeGesture() { return false; }
+  virtual bool handleBleKey(const freeink::KeyEvent&) { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
 
   // Start a new activity without destroying the current one

@@ -18,8 +18,8 @@ namespace {
 bool uiOwnsInput = false;
 bool uiInput = false;
 void memory(const char* stage) {
-  LOG_INF("BLE", "%s: free=%u min=%u maxBlock=%u running=%d connected=%d", stage, ESP.getFreeHeap(),
-          ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), BleHid.isRunning(), BleHid.isConnected());
+  LOG_INF("BLE", "%s: free=%u min=%u maxBlock=%u running=%d connected=%d connecting=%d", stage, ESP.getFreeHeap(),
+          ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), BleHid.isRunning(), BleHid.isConnected(), BleHid.isConnecting());
 }
 }  // namespace
 
@@ -41,6 +41,24 @@ void stop() {
 }
 
 void command(const String& command) {
+#ifdef CP_BLE_DIRECT_CONNECT
+  if (command.startsWith("BLE:OPTIONS:")) {
+    int type, first;
+    char extra;
+    const bool valid = sscanf(command.c_str(), "BLE:OPTIONS:%d:%d%c", &type, &first, &extra) == 2 && type >= -1 &&
+                       type <= 1 && (first == 0 || first == 1);
+    const bool ok = valid && BleHid.setDiagnosticOptions(type, first != 0);
+    LOG_INF("BLE", "options accepted=%d type=%d securityFirst=%d; format BLE:OPTIONS:<-1|0|1>:<0|1>", ok,
+            BleHid.diagnosticAddressType(), BleHid.diagnosticSecurityFirst());
+    return;
+  }
+  if (command == "BLE:STATUS") {
+    memory("status");
+    LOG_INF("BLE", "options type=%d securityFirst=%d", BleHid.diagnosticAddressType(),
+            BleHid.diagnosticSecurityFirst());
+    return;
+  }
+#endif
   if (uiOwnsInput) {
     LOG_INF("BLE", "Close the Bluetooth keyboard screen before using serial commands");
     return;
@@ -96,7 +114,12 @@ bool poll() {
     return BleScanDiagnostics::poll();
   }
 #endif
+#ifdef CP_BLE_SCAN_DIAGNOSTICS
+  // Keep diagnostic ON idle: only explicit connection requests may start a link.
+  if (BleHid.isConnecting() || BleHid.isConnected()) BleHid.poll();
+#else
   BleHid.poll();
+#endif
   static bool connected = false;
   if (connected != BleHid.isConnected()) {
     connected = BleHid.isConnected();

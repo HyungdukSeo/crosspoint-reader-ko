@@ -43,30 +43,35 @@ jobs:
 
     - name: Build CrossPoint
       run: |
-        pio run -e ble_probe
-        python3 scripts/check_ota_size.py .pio/build/ble_probe/firmware.bin
+        pio run -e ble_direct_debug
+        python3 scripts/check_ota_size.py .pio/build/ble_direct_debug/firmware.bin
 
     - name: Merge firmware binaries
       run: |
         python3 -m esptool --chip esp32c3 merge-bin \
-          -o ".pio/build/ble_probe/CrossPoint-${GITHUB_REF_NAME}.bin" \
+          -o ".pio/build/ble_direct_debug/CrossPoint-${GITHUB_REF_NAME}.bin" \
           --flash-mode dio \
           --flash-freq 80m \
           --flash-size 16MB \
-          0x0 .pio/build/ble_probe/bootloader.bin \
-          0x8000 .pio/build/ble_probe/partitions.bin \
-          0x10000 .pio/build/ble_probe/firmware.bin
+          0x0 .pio/build/ble_direct_debug/bootloader.bin \
+          0x8000 .pio/build/ble_direct_debug/partitions.bin \
+          0x10000 .pio/build/ble_direct_debug/firmware.bin
+        (
+          cd .pio/build/ble_direct_debug
+          shasum -a 256 firmware.bin bootloader.bin partitions.bin "CrossPoint-${GITHUB_REF_NAME}.bin" > SHA256SUMS
+        )
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: CrossPoint-${{ github.ref_name }}
         path: |
-          .pio/build/ble_probe/bootloader.bin
-          .pio/build/ble_probe/firmware.bin
-          .pio/build/ble_probe/firmware.elf
-          .pio/build/ble_probe/firmware.map
-          .pio/build/ble_probe/partitions.bin
+          .pio/build/ble_direct_debug/bootloader.bin
+          .pio/build/ble_direct_debug/firmware.bin
+          .pio/build/ble_direct_debug/firmware.elf
+          .pio/build/ble_direct_debug/firmware.map
+          .pio/build/ble_direct_debug/partitions.bin
+          .pio/build/ble_direct_debug/SHA256SUMS
 
     - name: Resolve release notes
       id: notes
@@ -86,10 +91,11 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          .pio/build/ble_probe/CrossPoint-${{ github.ref_name }}.bin
-          .pio/build/ble_probe/firmware.bin
-          .pio/build/ble_probe/bootloader.bin
-          .pio/build/ble_probe/partitions.bin
+          .pio/build/ble_direct_debug/CrossPoint-${{ github.ref_name }}.bin
+          .pio/build/ble_direct_debug/firmware.bin
+          .pio/build/ble_direct_debug/bootloader.bin
+          .pio/build/ble_direct_debug/partitions.bin
+          .pio/build/ble_direct_debug/SHA256SUMS
         body_path: ${{ steps.notes.outputs.path }}
         generate_release_notes: ${{ steps.notes.outputs.generate }}
         draft: false

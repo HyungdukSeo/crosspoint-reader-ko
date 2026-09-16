@@ -220,6 +220,9 @@ class EpubReaderActivity final : public Activity {
   // Prevent auto-sleep while auto page-turn is running so long unattended
   // reads don't get cut off by the global inactivity timer.
   bool preventAutoSleep() override { return automaticPageTurnActive; }
+#ifdef CP_BLE_PROBE
+  bool handleBleKey(const freeink::KeyEvent& key) override;
+#endif
   bool handleForcedRefresh() override {
     {
       RenderLock lock(*this);

@@ -1,0 +1,14 @@
+[BLE diag] options type=-1 securityFirst=1 timeout=20000
+[BLE stage] connect begin addr=ea:22:99:9e:a8:91 type=1 free=51052
+[BLE stage] link connected; HID discovery begin
+[BLE diag] security begin connected=1
+[BLE diag] security end ok=1 connected=1 lastError=0
+[BLE diag] service enumeration begin connected=1
+[BLE diag] services=5 connected=1 lastError=0 (may be stale)
+[BLE diag] service UUID=0x1801
+[BLE diag] service UUID=0x1800
+[BLE diag] service UUID=0x180f
+[BLE diag] service UUID=0x180a
+[BLE diag] service UUID=0x1812
+[BLE stage] security complete; input subscription begin
+[BLE stage] input subscription complete

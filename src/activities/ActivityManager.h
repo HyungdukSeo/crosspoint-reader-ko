@@ -16,6 +16,9 @@
 
 class Activity;    // forward declaration
 class RenderLock;  // forward declaration
+namespace freeink {
+struct KeyEvent;
+}
 
 enum class HomeMenuItem { NONE, FILE_BROWSER, RECENTS, OPDS_BROWSER, FILE_TRANSFER, SETTINGS_MENU };
 
@@ -102,6 +105,8 @@ class ActivityManager {
 
   bool preventAutoSleep() const;
   bool isReaderActivity() const;
+  bool isCurrentReaderActivity() const;
+  bool handleBleKey(const freeink::KeyEvent& key);
   bool handleForcedRefresh();
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;

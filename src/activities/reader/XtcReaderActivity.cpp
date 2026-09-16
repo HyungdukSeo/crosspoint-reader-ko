@@ -7,6 +7,9 @@
 
 #include "XtcReaderActivity.h"
 
+#ifdef CP_BLE_PROBE
+#include <BleKeyboardHost.h>
+#endif
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -163,6 +166,34 @@ void XtcReaderActivity::loop() {
     requestUpdate();
   }
 }
+
+#ifdef CP_BLE_PROBE
+bool XtcReaderActivity::handleBleKey(const freeink::KeyEvent& key) {
+  if (key.special != freeink::SpecialKey::PageUp && key.special != freeink::SpecialKey::PageDown) return false;
+  if (!xtc) return true;
+
+  const bool next = key.special == freeink::SpecialKey::PageDown;
+  if (currentPage >= xtc->getPageCount()) {
+    if (endOfBookOptions.menuActive()) return true;
+    if (next) {
+      onGoHome();
+    } else {
+      currentPage = xtc->getPageCount() > 0 ? xtc->getPageCount() - 1 : 0;
+      requestUpdate();
+    }
+    return true;
+  }
+
+  if (next) {
+    currentPage++;
+    if (currentPage >= xtc->getPageCount()) currentPage = xtc->getPageCount();
+  } else if (currentPage > 0) {
+    currentPage--;
+  }
+  requestUpdate();
+  return true;
+}
+#endif
 
 void XtcReaderActivity::render(RenderLock&&) {
   if (!xtc) {
